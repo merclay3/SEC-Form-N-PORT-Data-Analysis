@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Kruse"
+    given-names: "Meredith"
+    orcid: "https://orcid.org/0009-0007-5913-5945" # Optional
+title: "SEC-Form-N-PORT-Data-Collection"
+version: "1.0.0"
+date-released: 2026-09-10
+url: "https://github.com/merclay3/SEC-Form-N-PORT-Data-Collection"
