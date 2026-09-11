@@ -4,7 +4,7 @@ authors:
   - family-names: "Kruse"
     given-names: "Meredith"
     orcid: "https://orcid.org/0009-0007-5913-5945" # Optional
-title: "SEC-Form-N-PORT-Data-Collection"
+title: "SEC-Form-N-PORT-Data-Analysis"
 version: "1.0.0"
 date-released: 2026-09-10
-url: "https://github.com/merclay3/SEC-Form-N-PORT-Data-Collection"
+url: "https://github.com/merclay3/SEC-Form-N-PORT-Data-Analysis"
