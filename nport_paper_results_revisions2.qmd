@@ -1,0 +1,1005 @@
+---
+title: "paper revisions 2"
+format: html
+editor: visual
+---
+
+```{r}
+#| label: load-packages
+#| include: false
+
+# packages_to_load <- c("RPostgreSQL", "DBI", "dplyr", "tidyverse", "RPostgres",
+#                    "lubridate", "readxl", "ggplot2", "knitr", "kableExtra",
+#                    "DescTools", "bizdays", "RQuantLib", "plm", "broom", 
+#                    "purrr", "PerformanceAnalytics", "xts", "MuMIn", "tidyr",
+#                    "progress", "stringr")
+# lapply(packages_to_load, library, character.only = TRUE)
+
+library(RPostgreSQL)
+library(DBI)
+library(dplyr)
+library(tidyverse)
+library(RPostgres)
+library(lubridate)
+library(readxl)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(DescTools)
+library(bizdays)
+library(RQuantLib)
+library(plm)
+library(broom)
+library(purrr)
+library(PerformanceAnalytics)
+library(xts)
+library(MuMIn)
+library(tidyr)
+library(progress)
+library(stringr)
+library(latex2exp)
+library(forecast)
+library(nlme)
+```
+
+## Data
+
+```{r}
+#read in data (this is NOT the same as the original paper results)
+delta_df <- readRDS('/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/NPORT/adj_balance_aggregate_deltas.RDS')
+
+# # outlier removal
+# # Calculate mean and sd
+# mean_ret <- mean(delta_df$quarterly_return, na.rm = TRUE)
+# sd_ret   <- sd(delta_df$quarterly_return, na.rm = TRUE)
+# 
+# # Define bounds
+# lower_bound <- mean_ret - 6 * sd_ret
+# upper_bound <- mean_ret + 6 * sd_ret
+# 
+# # Select outlier ISINs
+# outlier_isins <- unique(delta_df$isin[
+#   delta_df$quarterly_return < lower_bound |
+#   delta_df$quarterly_return> upper_bound
+# ])
+# 
+# length(outlier_isins)
+# outlier_isins
+# 
+# delta_df_cleaned <- delta_df %>%
+#   filter(!isin %in% outlier_isins)
+```
+
+```{r}
+#crsp_data
+crsp_data <- readRDS('/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/NPORT/cleaned_crsp_with_universe.RDS')
+
+crsp_df <- crsp_data %>%
+  group_by(ISIN) %>%
+  arrange(date, .by_group = TRUE) %>%
+  mutate(
+    daily_log_ret = {
+      # convert each stock’s price series to xts with its date index
+      price_xts <- xts(adj_prc, order.by = date)
+      as.numeric(Return.calculate(price_xts, method = "log"))
+    }
+  ) %>%
+  ungroup()
+
+r2_crsp <- crsp_df %>% filter(Universe == "R2")
+```
+
+## Functions
+
+```{r}
+future_returns <- function(delta_df, crsp_df, b){
+  
+  new_date <- paste0("adj_date_b", b)
+  new_prc <- paste0("prc_b", b)
+  new_returns <- paste0("log_ret_b", b)
+  
+  delta_df[[new_date]] <- adjust.next(delta_df$adj_period_of_report + b, 
+                               "QuantLib/UnitedStates/NYSE")    
+  
+  
+  delta_df <- delta_df %>%
+        left_join(crsp_df %>% 
+                    select(ISIN, date, adj_prc) %>%
+                    rename(!!new_prc := adj_prc),
+                  by = c("isin" = "ISIN", setNames("date", new_date)))
+        
+  
+  delta_df <- delta_df %>%
+      arrange(isin, adj_period_of_report) %>%
+      group_by(isin, quarter_indicator) %>%
+      group_split() %>%
+      map_df(function(group_df) {
+        if (nrow(group_df) > 1) {
+          # Convert to xts object
+          xts_prices <- xts(group_df[[new_prc]], order.by = group_df[[new_date]])
+          
+          # Calculate log price returns
+          xts_returns <- Return.calculate(xts_prices, method = "log")
+          
+          # Merge back into original group_df
+          group_df[[new_returns]] <- coredata(xts_returns)
+        } else {
+          group_df[[new_returns]] <- NA
+        }
+        
+        return(group_df)
+      })
+  
+    delta_df[[new_returns]] <- as.numeric(delta_df[[new_returns]])
+    
+    return(delta_df)
+}
+```
+
+```{r}
+create_pdata_rolling <- function(df, num_panels, dependent_var, independent_var, quarter, index, window_size){
+  
+  delta_df <- df %>% filter(quarter_indicator == quarter)
+  delta_df <- delta_df %>%
+    drop_na(all_of(dependent_var), all_of(independent_var))
+  
+  delta_df <- delta_df %>%
+    group_by(isin) %>%
+    filter(n() == num_panels) %>%
+    arrange(adj_period_of_report) %>%
+    ungroup()
+  
+  # CHANGED: derive split_dates automatically from the sorted unique dates in the data
+  all_dates <- sort(unique(delta_df$adj_period_of_report))
+  
+  # CHANGED: test dates start after window_size periods so there's always a full training window
+  split_dates <- all_dates[(window_size + 1):length(all_dates)]
+  
+  # CHANGED: loop over split_dates, building a fixed-size rolling training window each iteration
+  splits <- lapply(split_dates, function(split_date) {
+    
+    # CHANGED: find the window_size dates immediately before split_date
+    prior_dates <- all_dates[all_dates < split_date]
+    train_dates <- tail(prior_dates, window_size)   # CHANGED: rolling — only the last window_size periods
+    
+    train <- delta_df %>%
+      filter(adj_period_of_report %in% train_dates)  # CHANGED: filter to exact rolling window dates
+    
+    test <- delta_df %>%
+      filter(adj_period_of_report == split_date)     # UNCHANGED: same filter logic
+    
+    # UNCHANGED: skip this window if train or test is empty
+    if (nrow(train) == 0 || nrow(test) == 0) {
+      warning(paste("Skipping split_date", split_date, "- empty train or test set"))
+      return(NULL)
+    }
+    
+    train_pdata <- pdata.frame(train, index = index)  # UNCHANGED
+    test_pdata  <- pdata.frame(test,  index = index)  # UNCHANGED
+    
+    list(train = train_pdata, test = test_pdata)      # UNCHANGED: same output structure per window
+  })
+  
+  # UNCHANGED: name each split by its date and drop any NULLs from skipped windows
+  names(splits) <- as.character(split_dates)
+  splits <- Filter(Negate(is.null), splits)
+  
+  return(splits)
+}
+```
+
+```{r}
+create_pdata_expanding <- function(df, num_panels, dependent_var, independent_var, quarter, index, split_dates){
+  
+  delta_df <- df %>% filter(quarter_indicator == quarter)
+  delta_df <- delta_df %>%
+    drop_na(all_of(dependent_var), all_of(independent_var))
+  
+  delta_df <- delta_df %>%
+    group_by(isin) %>%
+    filter(n() == num_panels) %>%
+    arrange(adj_period_of_report) %>%
+    ungroup()
+  
+  # CHANGED: loop over split_dates, building an expanding training window each iteration
+  splits <- lapply(split_dates, function(split_date) {
+    
+    train <- delta_df %>%
+      filter(adj_period_of_report < split_date)   # UNCHANGED: same filter logic
+    
+    test <- delta_df %>%
+      filter(adj_period_of_report == split_date)  # UNCHANGED: same filter logic
+    
+    # CHANGED: skip this window if train or test is empty (can happen at edges of date range)
+    if (nrow(train) == 0 || nrow(test) == 0) {
+      warning(paste("Skipping split_date", split_date, "- empty train or test set"))
+      return(NULL)
+    }
+    
+    train_pdata <- pdata.frame(train, index = index)  # UNCHANGED
+    test_pdata  <- pdata.frame(test,  index = index)  # UNCHANGED
+    
+    list(train = train_pdata, test = test_pdata)      # UNCHANGED: same output structure per window
+  })
+  
+  # CHANGED: name each split by its date and drop any NULLs from skipped windows
+  names(splits) <- as.character(split_dates)
+  splits <- Filter(Negate(is.null), splits)
+  
+  return(splits)
+}
+```
+
+```{r}
+panel_analysis1 <- function(train_pdata, test_pdata, independent_var, dependent_var,
+                           random_effect = TRUE,
+                           title1 = "Predicted vs. Actual", 
+                           xlab = "Predicted", ylab = "Actual",
+                           legend_title = "Estimated Return Classification",
+                           title2 = "Out of Sample Estimation Accuracy by Sector"){
+  
+  #Panel Formula
+  formula <- as.formula(paste(dependent_var, "~", independent_var))
+  
+  # Fixed Effects Model
+  fe_model <- plm(formula, data = train_pdata, model = "within")
+  
+  # Random Effects Model
+  re_model <- plm(formula, data = train_pdata, model = "random")
+  
+  if(random_effect == TRUE){
+    final_model <- re_model
+  }else{
+    final_model <- fe_model
+  }
+  
+  # Hausman Test to choose between FE and RE
+  hausman_test <- phtest(fe_model, re_model)
+  print(hausman_test)
+
+  if (as.numeric(hausman_test$p.value) < 0.05) {
+    #final_model <- fe_model
+    print("Based on the Hausman test, a fixed effects model was chosen as the final model.")
+  } else {
+    #final_model <- re_model
+    print("Based on the Hausman test, a random effects model was chosen as the final model.")
+  }
+
+  test_pdata <- test_pdata %>%
+    mutate(predicted_value = predict(final_model, newdata = test_pdata))
+  
+  
+  #Creating Estimation Table and Color Coded Plot
+  df <- test_pdata %>% 
+    select(
+      actual = dependent_var,
+      predicted = predicted_value
+    )
+  
+  # Define band width around y = x
+  delta <- .25*sd(df$actual)  # Adjust as needed
+  
+  # Classify points
+  df$category <- NA
+  
+  # Quadrant 1: Correct Positive Prediction
+  df$category[df$predicted > 0 & df$actual > df$predicted - delta] <- "Correct Positive"
+  
+  # Quadrant 2: Incorrect (False Negative)
+  df$category[df$predicted < 0 & df$actual > df$predicted + delta] <- "False Negative"
+  
+  # Quadrant 3: Correct Negative Prediction
+  df$category[df$predicted < 0 & df$actual < df$predicted + delta] <- "Correct Negative"
+  
+  # Quadrant 4: Incorrect (False Positive)
+  df$category[df$predicted > 0 & df$actual < df$predicted - delta] <- "False Positive"
+  
+  # Convert category to factor for ordered legend
+  df$category <- factor(df$category)
+  
+  # Plot with color coding
+  plot <- ggplot(df, aes(x = predicted, y = actual, color = category)) +
+      geom_point(alpha = 0.7) +  # Adjust transparency for better visualization
+      geom_abline(slope = 1, intercept = 0, color = "black", linetype = "dashed") +  # y = x line
+        geom_abline(slope = 1, intercept = delta, color = "blue") +
+      geom_abline(slope = 1, intercept = -delta, color = "blue") +
+      scale_color_manual(values = c("Correct Positive" = "darkblue",
+                                    "Correct Negative" = "steelblue2",
+                                    "False Positive" = "darkorange2",
+                                    "False Negative" = "goldenrod1")) +
+      labs(title = str_wrap(title1, width = 60),
+           x = xlab,
+           y = ylab,
+           color = legend_title) +
+      theme_minimal()
+  
+  summary_table <- df %>%
+    group_by(category) %>%
+    summarise(count = n()) %>%
+    mutate(percentage = count / sum(count) * 100)
+  
+  df2 <- df
+  df2$isin <- substr(rownames(df2), 1, 12)
+  df2 <- as.data.frame(df2)
+  test_df <- as.data.frame(test_pdata)
+  
+  test_df$isin <- as.character(test_df$isin)
+  df2$isin   <- as.character(df2$isin)
+
+  df2 <- left_join(df2, test_df, by = "isin")
+  
+  summary_table2 <- df2 %>%
+    group_by(SECTORS, category) %>%
+    summarise(count = n()) %>%
+    mutate(percentage = count / sum(count) * 100) %>%
+    ungroup()
+  #summary_table2
+  
+  
+  sector_plot <- ggplot(summary_table2, aes(x = SECTORS, y = count, fill = category)) +
+        geom_bar(stat = "identity", position = "stack") +  # Stacked bar chart
+        geom_text(aes(label = paste0(round(percentage, 1), "%")), 
+                  position = position_stack(vjust = 0.5), size = 3, color = "cornsilk") +  # Add percentage labels
+        labs(x = "Sector", 
+             y = "Count", 
+             title =  str_wrap(title2, width = 60), 
+             fill = legend_title) +
+        scale_fill_manual(values = c("Correct Positive" = "darkblue",
+                                      "Correct Negative" = "steelblue2",
+                                      "False Positive" = "darkorange2",
+                                          "False Negative" = "goldenrod1")) +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels if needed
+  
+    # --- ADDED: naive benchmark using training mean ---
+    train_mean <- mean(as.data.frame(train_pdata)[[dependent_var]], na.rm = TRUE)
+    
+    naive_df <- df %>%
+      mutate(
+        naive_predicted = train_mean,
+        naive_category  = case_when(
+          naive_predicted > 0 & actual > naive_predicted - delta ~ "Correct Positive",
+          naive_predicted < 0 & actual > naive_predicted + delta ~ "False Negative",
+          naive_predicted < 0 & actual < naive_predicted + delta ~ "Correct Negative",
+          naive_predicted > 0 & actual < naive_predicted - delta ~ "False Positive"
+        ),
+        naive_category = factor(naive_category)
+      )
+    
+    naive_table <- naive_df %>%
+      group_by(naive_category) %>%
+      summarise(count = n()) %>%
+      mutate(percentage = count / sum(count) * 100) %>%
+      rename(category = naive_category)
+    # --- END ADDED ---
+    
+    # UNCHANGED: same output list structure as original
+    output <- list(final_model, plot, summary_table, sector_plot, 
+                   summary_table2, df, naive_table)
+    names(output) <- c("final_model", "estimation_plot", "estimation_table",
+                       "sector_barplot", "sector_table", "prediction_data", "naive_table")
+  
+
+  # output <- list(final_model, plot, summary_table, sector_plot, summary_table2, df)
+  # names(output) <- c("final_model", "estimation_plot", "estimation_table", "sector_barplot", "sector_table", "prediction_data")
+  
+  return(output)
+}
+```
+
+```{r}
+panel_analysis2 <- function(splits, independent_var, dependent_var,
+                                     random_effect = TRUE,
+                                     title1 = "Predicted vs. Actual",
+                                     xlab = "Predicted", ylab = "Actual",
+                                     legend_title = "Estimated Return Classification",
+                                     title2 = "Out of Sample Estimation Accuracy by Sector") {
+  
+  # CHANGED: loop over each named split window
+  results <- lapply(names(splits), function(split_date) {
+    
+    cat("\n===== Running panel_analysis for split date:", split_date, "=====\n")
+    
+    train_pdata <- splits[[split_date]]$train   # UNCHANGED: same variable names as original
+    test_pdata  <- splits[[split_date]]$test    # UNCHANGED
+    
+    # ---- Everything below is UNCHANGED from original panel_analysis ----
+    
+    formula <- as.formula(paste(dependent_var, "~", independent_var))
+    
+    fe_model <- plm(formula, data = train_pdata, model = "within")
+    re_model <- plm(formula, data = train_pdata, model = "random")
+    
+    if(random_effect == TRUE){
+      final_model <- re_model
+    } else {
+      final_model <- fe_model
+    }
+    
+    hausman_test <- phtest(fe_model, re_model)
+    print(hausman_test)
+    
+    if (as.numeric(hausman_test$p.value) < 0.05) {
+      print("Based on the Hausman test, a fixed effects model was chosen as the final model.")
+    } else {
+      print("Based on the Hausman test, a random effects model was chosen as the final model.")
+    }
+    
+    test_pdata <- test_pdata %>%
+      mutate(predicted_value = predict(final_model, newdata = test_pdata))
+    
+    df <- test_pdata %>%
+      select(
+        actual = dependent_var,
+        predicted = predicted_value
+      )
+    
+    delta <- .25 * sd(df$actual)
+    
+    df$category <- NA
+    df$category[df$predicted > 0 & df$actual > df$predicted - delta] <- "Correct Positive"
+    df$category[df$predicted < 0 & df$actual > df$predicted + delta] <- "False Negative"
+    df$category[df$predicted < 0 & df$actual < df$predicted + delta] <- "Correct Negative"
+    df$category[df$predicted > 0 & df$actual < df$predicted - delta] <- "False Positive"
+    df$category <- factor(df$category)
+    
+    plot <- ggplot(df, aes(x = predicted, y = actual, color = category)) +
+      geom_point(alpha = 0.7) +
+      geom_abline(slope = 1, intercept = 0,      color = "black",  linetype = "dashed") +
+      geom_abline(slope = 1, intercept =  delta, color = "blue") +
+      geom_abline(slope = 1, intercept = -delta, color = "blue") +
+      scale_color_manual(values = c("Correct Positive" = "darkblue",
+                                    "Correct Negative" = "steelblue2",
+                                    "False Positive"   = "darkorange2",
+                                    "False Negative"   = "goldenrod1")) +
+      labs(title = str_wrap(paste(title1, ":", split_date), width = 60),  # CHANGED: date appended to title
+           x = xlab, y = ylab, color = legend_title) +
+      theme_minimal()
+    
+    summary_table <- df %>%
+      group_by(category) %>%
+      summarise(count = n()) %>%
+      mutate(percentage = count / sum(count) * 100)
+    
+    df2 <- df
+    df2$isin <- substr(rownames(df2), 1, 12)
+    df2 <- as.data.frame(df2)
+    test_df <- as.data.frame(test_pdata)
+    
+    test_df$isin <- as.character(test_df$isin)
+    df2$isin     <- as.character(df2$isin)
+    
+    df2 <- left_join(df2, test_df, by = "isin")
+    
+    summary_table2 <- df2 %>%
+      group_by(SECTORS, category) %>%
+      summarise(count = n()) %>%
+      mutate(percentage = count / sum(count) * 100) %>%
+      ungroup()
+    
+    sector_plot <- ggplot(summary_table2, aes(x = SECTORS, y = count, fill = category)) +
+      geom_bar(stat = "identity", position = "stack") +
+      geom_text(aes(label = paste0(round(percentage, 1), "%")),
+                position = position_stack(vjust = 0.5), size = 3, color = "cornsilk") +
+      labs(x = "Sector", y = "Count",
+           title = str_wrap(paste(title2, ":", split_date), width = 60),  # CHANGED: date appended to title
+           fill = legend_title) +
+      scale_fill_manual(values = c("Correct Positive" = "darkblue",
+                                   "Correct Negative"  = "steelblue2",
+                                   "False Positive"    = "darkorange2",
+                                   "False Negative"    = "goldenrod1")) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    
+    
+    # --- ADDED: naive benchmark using training mean ---
+    train_mean <- mean(as.data.frame(train_pdata)[[dependent_var]], na.rm = TRUE)
+    
+    naive_df <- df %>%
+      mutate(
+        naive_predicted = train_mean,
+        naive_category  = case_when(
+          naive_predicted > 0 & actual > naive_predicted - delta ~ "Correct Positive",
+          naive_predicted < 0 & actual > naive_predicted + delta ~ "False Negative",
+          naive_predicted < 0 & actual < naive_predicted + delta ~ "Correct Negative",
+          naive_predicted > 0 & actual < naive_predicted - delta ~ "False Positive"
+        ),
+        naive_category = factor(naive_category)
+      )
+    
+    naive_table <- naive_df %>%
+      group_by(naive_category) %>%
+      summarise(count = n()) %>%
+      mutate(percentage = count / sum(count) * 100) %>%
+      rename(category = naive_category)
+    # --- END ADDED ---
+    
+    # UNCHANGED: same output list structure as original
+    output <- list(final_model, plot, summary_table, sector_plot, 
+                   summary_table2, df, naive_table)
+    names(output) <- c("final_model", "estimation_plot", "estimation_table",
+                       "sector_barplot", "sector_table", "prediction_data", "naive_table")
+    return(output)
+  })
+  
+  # CHANGED: name the outer list by split date so results[["2023-12-31"]] etc. works intuitively
+  names(results) <- names(splits)
+  return(results)
+}
+```
+
+## Iterative Panel Data with Rolling Window
+
+```{r}
+load_quantlib_calendars("UnitedStates/NYSE", from = "2019-01-01", to = "2025-12-31")
+
+#looping through differetn day values for the returns series
+b_values <- c(1, 5, 10, 20, 30, 60, 65)
+results <- list()
+
+for (b in b_values) {
+  
+  # Create dynamic variable names
+  dep_var   <- paste0("log_ret_b", b)
+  index_var <- paste0("adj_date_b", b)
+  
+  # Future returns
+  final_df <- future_returns(delta_df, r2_crsp, b = b)
+  
+  # Create rolling window splits
+  splits <- create_pdata_rolling(
+    df              = final_df,
+    num_panels      = 18,
+    dependent_var   = dep_var,
+    independent_var = "adjusted_notional_delta",
+    quarter         = 3,
+    index           = c("isin", index_var),
+    window_size     = 8
+  )
+  
+  # Extract the last time point from the rolling splits
+  last_date  <- names(splits)[length(splits)]
+  last_split <- splits[[last_date]]
+  
+  # Panel analysis on the last split only
+  pdata_output <- panel_analysis1(
+    train_pdata     = last_split$train,
+    test_pdata      = last_split$test,
+    independent_var = "adjusted_notional_delta",
+    dependent_var   = dep_var,
+    random_effect   = TRUE,
+    title1          = paste0("Out of Sample Estimation (b=", b, ", ", last_date, " Russell 2000 Holdings)"),
+    title2          = paste0("Out of Sample Estimation Accuracy by Sector (b=", b, ", ", last_date, " Russell 2000 Holdings)"),
+    xlab            = "Estimated Return",
+    ylab            = "Actual Return",
+    legend_title    = "Estimated Return Classification"
+  )
+  
+  # Store results
+  results[[paste0("b", b)]] <- pdata_output
+  
+  # Print outputs
+  # cat("\n========== b =", b, "| Last Split Date:", last_date, "==========\n")
+  # print(summary(pdata_output$final_model))
+  # print(pdata_output$estimation_plot)
+  # print(pdata_output$estimation_table)
+  # print(pdata_output$sector_barplot)
+}
+```
+
+```{r}
+#this is all trained on the 8 periods leading up to september 2024
+b_summary_table <- imap_dfr(results, function(res, split_date) {
+  tbl <- res$estimation_table
+  model <- res$final_model
+  cat_col <- tbl[[1]]
+  
+  # Create and return a single row for this b_d value
+  tibble(
+    b = split_date,
+    R_Squared = r.squared(model),
+    beta = model$coefficients[2],
+    z_value = coef(summary(model))[2, "z-value"],
+    p_value = coef(summary(model))[2, "Pr(>|z|)"],
+    Total_Percent_Correct = sum(tbl$percentage[cat_col %in% c("Correct Negative", "Correct Positive")]),
+    True_Positive_Percent  = sum(tbl$percentage[cat_col == "Correct Positive"]),
+    True_Negative_Percent  = sum(tbl$percentage[cat_col == "Correct Negative"]),
+    False_Negative_Percent = sum(tbl$percentage[cat_col == "False Negative"]),
+    False_Positive_Percent = sum(tbl$percentage[cat_col == "False Positive"])
+  )
+})
+
+# Print the result
+print(b_summary_table)
+```
+
+## Rolling Window
+
+I forced the rolling window to be 10 time points (a year and a half) because we need \>8 time points for the Granger Causality test.
+
+Should I do the granger causality test on the entire dataframe and not just 10 time points (T=17) because the model performs better with T=8 than T=10 and I think 2 years fo data makes more sense than 2.5
+
+```{r}
+df_b1 <- future_returns(delta_df, r2_crsp, b = 1)
+
+splits <- create_pdata_rolling(
+    df              = df_b1,
+    num_panels      = 18,
+    dependent_var   = "log_ret_b1",
+    independent_var = "adjusted_notional_delta",
+    quarter         = 3,
+    index           = c("isin", "adj_period_of_report"),
+    window_size     = 8
+)
+results2 <- panel_analysis2(splits, 
+                          independent_var = "adjusted_notional_delta",
+                          dependent_var = "log_ret_b1")
+```
+
+```{r}
+#granger causality test included in plm package for entire data frame T=18
+sept_df <- df_b1
+sept_df$adj_period_of_report <- as.integer(as.factor(sept_df$adj_period_of_report))
+granger_pdata <- pdata.frame(sept_df, index = c("isin", "adj_period_of_report"))
+pgrangertest(log_ret_b1 ~ adjusted_notional_delta, data = granger_pdata)
+```
+
+Discuss impact of COVID on model performance. The rolling window stops containing 2020 data in March 2023 out of sample estimation
+
+```{r}
+final_summary_table <- imap_dfr(results2, function(res, split_date) {
+  
+  tbl <- res$estimation_table
+  naive <- res$naive
+  model <- res$final_model
+  prediction <- res$prediction_data
+  cat_col <- tbl[[1]]
+  
+  # Create and return a single row for this date
+  tibble(
+    Date = split_date,
+    R_Squared = r.squared(model),
+    MAE = mean(abs(prediction$actual - prediction$predicted)),
+    RMSE = sqrt(mean((prediction$actual - prediction$predicted)^2)),
+    Total_Percent_Correct_Naive = sum(naive$percentage[naive[[1]] %in% c("Correct Negative", "Correct Positive")]),
+    Total_Percent_Correct = sum(tbl$percentage[cat_col %in% c("Correct Negative", "Correct Positive")]),
+    True_Positive_Percent  = sum(tbl$percentage[cat_col == "Correct Positive"]),
+    True_Negative_Percent  = sum(tbl$percentage[cat_col == "Correct Negative"]),
+    False_Negative_Percent = sum(tbl$percentage[cat_col == "False Negative"]),
+    False_Positive_Percent = sum(tbl$percentage[cat_col == "False Positive"])
+  )
+})
+
+# Print the result
+print(final_summary_table)
+```
+
+## September Regression
+
+```{r}
+#final model trained with one hold out period
+sept_results <- results2[["2024-09-30"]]
+sept_resid <- sept_results$prediction_data$actual - sept_results$prediction_data$predicted
+sept_rmse <- sqrt(mean((sept_resid)^2))
+sept_mae <- mean(abs(sept_resid))
+
+summary(sept_results$final_model)
+sept_rmse
+sept_mae
+sept_results$estimation_table
+sept_results$estimation_plot
+sept_results$sector_barplot
+```
+
+```{r}
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/NPORT/paper_figures_v2/sept_scatter_b=1_v2.jpg",
+  plot = sept_results$estimation_plot,
+  width = 8, height = 4, units = "in", dpi = 600
+)
+
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/NPORT/paper_figures_v2/sept_bar_b=1_v2.jpg",
+  plot = sept_results$sector_barplot,
+  width = 8, height = 6, units = "in", dpi = 600
+)
+```
+
+```{r}
+#hausman test
+sept_pdata <- splits$`2024-09-30`$train
+
+# 2. Define the formula
+panel_formula <- log_ret_b1 ~ adjusted_notional_delta
+
+# 3. Estimate the Baseline Models
+sept_fe <- plm(panel_formula, data = sept_pdata, model = "within")
+sept_re <- plm(panel_formula, data = sept_pdata, model = "random")
+
+# 4. Run the Cluster-Robust Hausman Test
+# (method = "aux" uses Wooldridge's regression-based test to allow a robust vcov)
+robust_hausman <- phtest(
+  panel_formula, 
+  data = sept_pdata, 
+  method = "aux", 
+  vcov = function(x) vcovHC(x, method = "arellano", type = "HC1", cluster = "group")
+)
+
+# Print the test results to your console
+print(robust_hausman)
+
+```
+
+```{r}
+##save september isin list for future reference:
+isins <- unique(sept_pdata$isin)
+saveRDS(isins, "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/NPORT/isins.RDS")
+```
+
+## Sector Analysis
+
+```{r}
+sept_pdata_train <- splits[["2024-09-30"]]$train
+sept_pdata_test <- splits[["2024-09-30"]]$test
+sectors <- c(as.character(unique(sept_pdata_train$SECTORS)))
+sectors <- sectors[!is.na(sectors)]
+
+train_pdata <- list()
+test_pdata <- list()
+re_panel_models <- list()
+fe_panel_models <- list()
+
+sector_table <- data.frame(matrix(nrow = 11, ncol = 5))
+colnames(sector_table) <- c("sector", "n", "significant_FE", "r_squared", "percent_correct")
+
+
+sector_table$sector <- sectors
+
+
+for(i in 1:length(sectors)){
+  train_pdata[[i]] <- as.data.frame(sept_pdata_train) %>% filter(SECTORS == sectors[i])
+  test_pdata[[i]] <- as.data.frame(sept_pdata_test) %>% filter(SECTORS == sectors[i])
+  
+  fe_panel_models[[i]] <- plm(log_ret_b1 ~ adjusted_notional_delta, 
+                data = train_pdata[[i]], 
+                model = "within",
+                index = c("isin", "adj_period_of_report"))
+  
+  re_panel_models[[i]] <- plm(log_ret_b1 ~ adjusted_notional_delta, 
+                data = train_pdata[[i]], 
+                model = "random",
+                index = c("isin", "adj_period_of_report"))
+  
+  print(sectors[i])
+  print(phtest(fe_panel_models[[i]], re_panel_models[[i]]))
+  
+  sector_table$n[i] <- length(unique(train_pdata[[i]]$isin)) 
+  sector_table$r_squared[i] <- round(summary(fe_panel_models[[i]])$r.squared[1], 2)
+  
+  #fixed effects column
+  fe_summary <- as.data.frame(summary(fixef(fe_panel_models[[i]])))
+  fe_count <- sum(fe_summary$`Pr(>|t|)` < 0.1)
+  sector_table$significant_FE[i] <- round(fe_count/sector_table$n[i],4)
+  
+  #prediction
+  #note that you have a different n for the prediction
+  test_pdata[[i]] <- pdata.frame(test_pdata[[i]], index = c("isin", "adj_period_of_report"))
+  test_pdata[[i]]$predicted_return <- predict(fe_panel_models[[i]], newdata = test_pdata[[i]])
+  
+  # Define delta for correct classification
+  delta <- 0.25 * sd(test_pdata[[i]]$quarterly_return, na.rm = TRUE)
+
+  # Initialize category
+  test_pdata[[i]]$category <- NA
+
+  # Apply your logic
+  test_pdata[[i]]$category[test_pdata[[i]]$predicted_return > 0 & 
+                         test_pdata[[i]]$quarterly_return > test_pdata[[i]]$predicted_return - delta] <- "Correct"
+
+  test_pdata[[i]]$category[test_pdata[[i]]$predicted_return < 0 & 
+                         test_pdata[[i]]$quarterly_return > test_pdata[[i]]$predicted_return + delta] <- "Incorrect"
+
+  test_pdata[[i]]$category[test_pdata[[i]]$predicted_return < 0 & 
+                         test_pdata[[i]]$quarterly_return < test_pdata[[i]]$predicted_return + delta] <- "Correct"
+
+  test_pdata[[i]]$category[test_pdata[[i]]$predicted_return > 0 & 
+                         test_pdata[[i]]$quarterly_return < test_pdata[[i]]$predicted_return - delta] <- "Incorrect"
+
+  # Calculate percent correct
+  sector_table$percent_correct[i] <- round(
+    mean(test_pdata[[i]]$category == "Correct", na.rm = TRUE), 4
+) *100
+}
+names(test_pdata) <- sectors
+
+
+print(sector_table)
+```
+
+## Appendix A - Additional Quarters
+
+### October Regression
+
+```{r}
+pdata1 <- create_pdata_rolling(
+    df              = df_b1,
+    num_panels      = 18,
+    dependent_var   = "log_ret_b1",
+    independent_var = "adjusted_notional_delta",
+    quarter         = 1,
+    index           = c("isin", "adj_period_of_report"),
+    window_size     = 8
+)
+
+pdata1_output <- panel_analysis2(pdata1, 
+                          independent_var = "adjusted_notional_delta",
+                          dependent_var = "log_ret_b1")
+
+summary(pdata1_output$`2024-10-31`$final_model)
+```
+
+### November Regression
+
+```{r}
+pdata2 <- create_pdata_rolling(
+    df              = df_b1,
+    num_panels      = 18,
+    dependent_var   = "log_ret_b1",
+    independent_var = "adjusted_notional_delta",
+    quarter         = 2,
+    index           = c("isin", "adj_period_of_report"),
+    window_size     = 8
+)
+
+pdata2_output <- panel_analysis2(pdata2, 
+                          independent_var = "adjusted_notional_delta",
+                          dependent_var = "log_ret_b1")
+
+summary(pdata2_output$`2024-11-29`$final_model)
+```
+
+## Appendix C - Sensitivity Analysis
+
+### Standard Error Specification
+
+```{r}
+
+sept_pdata <- splits$`2024-09-30`$train
+sept_model <- sept_results$final_model
+
+# 1. Cross-Sectional Dependence Test (Pesaran CD test)
+# Null Hypothesis: No cross-sectional dependence
+# If p < 0.05, you have cross-sectional dependence.
+pcdtest(sept_model, test = "cd")
+
+# 2. Heteroskedasticity Test (Breusch-Pagan test)
+# Null Hypothesis: Homoskedasticity
+# If p < 0.05, you have heteroskedasticity.
+library(lmtest)
+bptest(log_ret_b1 ~ adjusted_notional_delta, data = sept_pdata, studentize = TRUE)
+
+# 3. Serial Correlation Test (Breusch-Godfrey/Wooldridge test)
+# Null Hypothesis: No serial correlation in idiosyncratic errors
+# If p < 0.05, you have serial correlation.
+pbgtest(sept_model)
+
+```
+
+```{r}
+# vcovHC with cluster = "group" clusters by the first index (asset_id)
+se_asset <- vcovHC(sept_model, type = "HC1", cluster = "group")
+coeftest(sept_model, vcov = se_asset)
+```
+
+```{r}
+# vcovDC calculates double-clustered standard errors
+se_twoway <- vcovDC(sept_model, type = "HC1")
+coeftest(sept_model, vcov = se_twoway)
+```
+
+```{r}
+# vcovSCC (Spatial Correlation Consistent) calculates Driscoll-Kraay SEs
+se_dk <- vcovSCC(sept_model, type = "HC3")
+coeftest(sept_model, vcov = se_dk)
+```
+
+## Appendix D - LME with AR(1)
+
+```{r}
+# Convert pdata to a regular data frame
+ar_data <- as.data.frame(sept_pdata_train)
+
+# Ensure identifiers and time are clean types
+ar_data$isin <- as.factor(as.character(ar_data$isin))
+ar_data$adj_period_of_report <- as.Date(ar_data$adj_period_of_report)
+
+# Should return 17 rows per id if balanced
+table(table(ar_data$isin))
+```
+
+```{r}
+# Random intercepts for each individual and AR(1) error within individual over time
+lme_model <- lme(fixed = log_ret_b1 ~ adjusted_notional_delta,  # fixed effects
+                 random = ~ 1 | isin,    # random intercept for panel units
+                 correlation = corAR1(form = ~ adj_period_of_report | isin),  # AR(1) within panels
+                 data = ar_data,
+                 method = "REML")  # or method = "ML" for model comparison
+
+
+summary(lme_model)
+#compute marginal and conditional R squared values
+r.squaredGLMM(lme_model)
+```
+
+```{r}
+# Extract residuals
+resid_vec <- residuals(lme_model, resType = "normalized")
+resid_list <- split(resid_vec, ar_data$isin)
+```
+
+```{r}
+lag1_autocorr <- sapply(resid_list, function(x) {
+  if (length(x) > 1) {
+    acf(x, lag.max = 1, plot = FALSE)$acf[2]  # lag 1 autocorrelation
+  } else {
+    NA  # too short to compute autocorrelation
+  }
+})
+
+# Remove NAs
+lag1_autocorr <- lag1_autocorr[!is.na(lag1_autocorr)]
+
+# lme_hist <- hist(lag1_autocorr, 
+#      #breaks = "scott", 
+#      main = "Lag-1 Residual Autocorrelation by ISIN", 
+#      xlab = "Lag-1 Autocorrelation", 
+#      col = "steelblue", 
+#      border = "white")
+
+lme_hist <- ggplot(data = NULL, aes(x = lag1_autocorr)) + 
+  geom_histogram(
+    bins = 20,        
+    fill = "steelblue",    
+    color = "white"        
+  ) +
+  labs(
+    title = "Lag-1 Residual Autocorrelation by ISIN", # Corresponds to base R 'main'
+    x = "Lag-1 Autocorrelation",                      # Corresponds to base R 'xlab'
+    y = "Count"                                       # Default y-axis for histograms
+  )
+
+
+print(lme_hist)
+
+boxplot(lag1_autocorr)
+
+summary(lag1_autocorr)
+
+acf_obj <- ACF(lme_model, resType = "normalized")
+acf_df <- as.data.frame(acf_obj)
+acf_df <- subset(acf_df, lag != 0)
+
+lme_acf <- ggplot(acf_df, aes(x = lag, y = ACF)) +
+  geom_hline(yintercept = 0, color = "gray") +
+  geom_segment(aes(xend = lag, yend = 0)) +
+  labs(title = "ACF Plot of LME Model Residuals",
+       x = "Lag", y = "ACF") +
+  theme_minimal()
+
+print(lme_acf)
+
+```
+
+```{r}
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/NPORT/paper_figures_v2/lme_hist.jpg",
+  plot = lme_hist,
+  width = 8, height = 4, units = "in", dpi = 600
+)
+
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/NPORT/paper_figures_v2/lme_acf.jpg",
+  plot = lme_acf,
+  width = 8, height = 4, units = "in", dpi = 600
+)
+```
