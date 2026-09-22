@@ -1,0 +1,271 @@
+---
+title: "Russell 2000 Deltas"
+format: html
+editor: visual
+---
+
+```{r}
+#packages
+library(RPostgreSQL)
+library(DBI)
+library(dplyr)
+library(tidyr)
+library(RPostgres)
+library(lubridate)
+library(readxl)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(DescTools)
+library(bizdays)
+library(RQuantLib)
+library(plm)
+library(broom)
+library(purrr)
+library(PerformanceAnalytics)
+library(xts)
+library(progress)
+library(stringr)
+library(latex2exp)
+```
+
+## Load In Price Data
+
+Make sure that your price data uses ISIN as the stock identifier to align with the Form N-PORT filings. For analysis in the form NPORT paper we use daily log-returns for each asset.
+
+```{r}
+#important features included in this data are the adjusted price, isin, sector, and stock universe indicator (includes R1 and R2 stocks)
+#Make sure that the price you are using is adjusted for stock splits
+
+crsp_data <- readRDS('/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/NPORT/cleaned_crsp_with_universe.RDS')
+```
+
+## CRSP Daily Returns
+
+```{r}
+crsp_df <- crsp_data %>%
+  group_by(ISIN) %>%
+  arrange(date, .by_group = TRUE) %>%
+  mutate(
+    daily_log_ret = {
+      # convert each stock’s price series to xts with its date index
+      price_xts <- xts(adj_prc, order.by = date)
+      as.numeric(Return.calculate(price_xts, method = "log"))
+    }
+  ) %>%
+  ungroup()
+
+r2_crsp <- crsp_df %>% filter(Universe == "R2")
+```
+
+## Load in NPORT Data
+
+For the following functions to work you must follow the same SQL structure that was provided in the python files stored on GitHub: https://github.com/merclay3/SEC-Form-N-PORT-Data-Analysis
+
+```{r}
+#sql pulling function
+#this function pulls data based on the stocks you are interested in looking at holdings for
+#it pulls all the holdings for a particular stock
+
+nport_pull_isin <- function(isin, date, con){
+  
+  # Create a progress bar object
+  pb <- progress::progress_bar$new(
+    format = "[:bar] :percent :eta",
+    total = length(isin),
+    clear = FALSE,
+    width = 60
+  )  
+  
+  df <- lapply(isin,
+              function(isin){
+                  # Tick the progress bar for each ISIN processed
+                 pb$tick()
+                
+                sqlStatement <- paste0("SELECT nport_holdings.series_id, nport_holdings.isin, nport_holdings.period_of_report, nport_holdings.filing_date, nport_holdings.balance, nport_holdings.units, nport_holdings.curcd FROM nport_holdings WHERE nport_holdings.isin = '", isin, "' AND nport_holdings.period_of_report >=", date, ";")
+                dbGetQuery(con, sqlStatement)
+                })
+  names(df) <- isin
+  return(df)
+}
+
+#this function pulls data based on the cik
+nport_pull_cik <- function(cik, date, con){
+  df <- lapply(cik,
+              function(cik){
+                sqlStatement <- paste0("SELECT nport_holdings.cik, nport_holdings.series_id, nport_holdings.isin, nport_holdings.period_of_report, nport_holdings.filing_date, nport_holdings.balance, nport_holdings.units, nport_holdings.curcd FROM nport_holdings WHERE nport_holdings.cik = '", cik, "' AND nport_holdings.period_of_report >=", date, ";")
+                dbGetQuery(con, sqlStatement)
+                })
+  names(df) <- cik
+  return(df)
+}
+
+#this function pulls data based on the series id
+nport_pull_series_id <- function(series_id, date, con){
+  df <- lapply(series_id,
+              function(series_id){
+                sqlStatement <- paste0("SELECT nport_holdings.cik, nport_holdings.series_id, nport_holdings.isin, nport_holdings.period_of_report, nport_holdings.filing_date, nport_holdings.balance, nport_holdings.units, nport_holdings.curcd FROM nport_holdings WHERE nport_holdings.series_id = '", series_id, "' AND nport_holdings.period_of_report >=", date, ";")
+                dbGetQuery(con, sqlStatement)
+                })
+  names(df) <- series_id
+  return(df)
+}
+
+```
+
+```{r}
+#function inputs
+con <- dbConnect(Postgres(), 
+                    dbname = "dbn",
+                    host = "localhost",
+                    port = 5434,
+                    user = "nport",
+                    password = "example2")
+
+date <- "'2020-03-01'"
+r2_isins <- unique(r2_crsp$ISIN)
+```
+
+```{r}
+full_nport_pull <- nport_pull_isin(r2_isins, date, con)
+```
+
+## Create a List of Holding Deltas
+
+The following function creates a list that contains a dataframe for each R2000 asset. The data frames are labeled by ISIN and contain the holding information for every fund (identified by series_id) holding the assets from March 2020 to December 2024. These data are the cleaned version of what was pulled directly from SQL and the function calculates the notional change in holdings for each fund-asset pair.
+
+```{r}
+get_delta_holdings <- function(crsp_data, holdings_data) {
+  # Load the calendar for business day calculations
+  load_quantlib_calendars("UnitedStates/NYSE", from = "2019-01-01", to = "2025-12-31")
+  # Create a progress bar object
+  pb <- progress::progress_bar$new(
+    format = "[:bar] :percent :eta",
+    total = length(holdings_data),
+    clear = FALSE,
+    width = 60
+  )  
+
+  # Filter out empty data frames from the holdings list
+  holdings_list <- holdings_data[lapply(holdings_data, nrow) != 0]
+
+  # Process each data frame in the list
+  deltas_list <- lapply(holdings_list, function(df) {
+    # Tick the progress bar for each ISIN processed
+    pb$tick()
+    
+    # Data cleaning and filtering
+    df <- df %>%
+      filter(units == "NS", balance >= 0, curcd == "USD", !is.na(series_id))
+
+    # Get previous business day and a public date
+    df$adj_date <- adjust.previous(df$period_of_report, 
+                                   "QuantLib/UnitedStates/NYSE")
+    
+
+    # Join with CRSP data to get publically available and current prices
+    df <- df %>%
+      left_join(crsp_data %>% select(ISIN, date, adj_prc, SECTORS, CFACPR, Universe),
+                by = c("isin" = "ISIN", "adj_date" = "date")) %>%
+      rename(adj_period_of_report = adj_date)
+    
+    #group together balances
+    df <- df %>%
+      group_by(series_id, isin, adj_period_of_report) %>%
+      # keep only the latest filing
+      filter(filing_date == max(filing_date, na.rm = TRUE)) %>%
+      # sum balance within that filing
+      mutate(balance = sum(balance, na.rm = TRUE)) %>%
+      # remove duplicate rows created by the mutate
+      distinct(series_id, isin, adj_period_of_report, filing_date, .keep_all = TRUE) %>%
+      ungroup()
+    
+    df <- df %>%
+      mutate(
+        quarter_indicator = case_when(
+          month(adj_period_of_report) %in% c(1, 4, 7, 10) ~ 1,
+          month(adj_period_of_report) %in% c(2, 5, 8, 11) ~ 2,
+          month(adj_period_of_report) %in% c(3, 6, 9, 12) ~ 3,
+          TRUE ~ NA_real_ # For any other cases
+          )
+      )
+      
+    # Calculate adjusted balance and total price
+    df$adj_balance <- df$balance * df$CFACPR
+    df$notional_prc <- df$adj_prc * df$adj_balance
+      
+    #calculate deltas while checking for valid lags
+    df <- df %>%
+      mutate(
+        year = lubridate::year(adj_period_of_report),
+        quarter = lubridate::quarter(adj_period_of_report),
+        q_index = year * 4 + quarter
+      ) %>%
+      group_by(series_id) %>%
+      arrange(adj_period_of_report) %>%
+      ungroup()
+  
+  #create new rows for missing lags
+    df <- df %>%
+      group_by(series_id, isin) %>%
+      arrange(q_index, .by_group = TRUE) %>%
+      # store first and last observed quarter
+      mutate(
+        first_q = min(q_index),
+        last_q  = max(q_index)
+      ) %>%
+      # complete ONLY inside observed range
+      complete(
+        q_index = seq(first_q[1], last_q[1], by = 1)
+      ) %>%
+      # fill balances only for internally missing quarters
+      mutate(
+        adj_balance = replace_na(adj_balance, 0),
+        notional_prc = replace_na(notional_prc, 0)
+      ) %>%
+      arrange(q_index, .by_group = TRUE) %>%
+      # now difference normally
+      mutate(
+        bal_delta = adj_balance - dplyr::lag(adj_balance),
+        notional_prc_delta = notional_prc - dplyr::lag(notional_prc)
+      ) %>%
+      ungroup()
+    
+    #fill new rows with missing values
+    df <- df %>%
+      group_by(series_id) %>%
+      mutate(
+        quarter_indicator = first(quarter_indicator[!is.na(quarter_indicator)])
+      ) %>%
+      ungroup()
+    
+    df <- df %>%
+      arrange(isin, q_index) %>%
+      # fill within quarter-security groups
+      group_by(isin, quarter_indicator, q_index) %>%
+      fill(
+        adj_period_of_report,
+        quarter_indicator,
+        adj_prc,
+        Universe,
+        SECTORS,
+        .direction = "downup"
+      ) %>%
+      ungroup() %>%
+      select(series_id, isin, adj_period_of_report, adj_prc,quarter_indicator, 
+             adj_balance, notional_prc, bal_delta, notional_prc_delta)
+
+    return(df)
+  })
+
+  # Set the names for the output list
+  names(deltas_list) <- names(holdings_list)
+
+  return(deltas_list)
+}
+```
+
+```{r}
+full_nport_deltas <- get_delta_holdings(crsp_data = crsp_df,
+                                 holdings_data = full_nport_pull)
+```
