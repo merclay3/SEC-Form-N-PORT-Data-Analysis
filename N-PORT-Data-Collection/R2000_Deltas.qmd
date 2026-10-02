@@ -163,14 +163,15 @@ get_delta_holdings <- function(crsp_data, holdings_data) {
                                    "QuantLib/UnitedStates/NYSE")
     
 
-    # Join with CRSP data to get publically available and current prices
+    # Join with CRSP data to get publicly available and current prices
     df <- df %>%
       left_join(crsp_data %>% select(ISIN, date, adj_prc, SECTORS, CFACPR, Universe),
                 by = c("isin" = "ISIN", "adj_date" = "date")) %>%
       rename(adj_period_of_report = adj_date)
     
-    #group together balances
+    #group together balances and remove duplicates
     df <- df %>%
+      distinct() %>%
       group_by(series_id, isin, adj_period_of_report) %>%
       # keep only the latest filing
       filter(filing_date == max(filing_date, na.rm = TRUE)) %>%
