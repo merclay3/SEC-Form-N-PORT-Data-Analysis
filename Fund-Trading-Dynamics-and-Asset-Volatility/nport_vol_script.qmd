@@ -173,8 +173,6 @@ delta_df <- no_zeros %>%
 
 ## Rolling Window Pipeline
 
-I have a new starting point here of loading in the data so I do not overload the storage
-
 ```{r}
 #Step 1: Gets trading dates that we will loop over
 get_signal_months <- function(prepped_data, window_months = 24) {
@@ -484,7 +482,6 @@ seller_summary_table <- bind_rows(seller_summary_rows)
 ### Universal Figures
 
 ```{r}
-#MAKE SURE YOU LOAD IN DELTA DF
 r2000 <- delta_df %>%
   select(isin, SECTORS) %>%
   distinct() %>%
@@ -572,20 +569,6 @@ print(fund_sectors_sell)
 ```
 
 ```{r}
-ggsave(
-  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/fund_sectors_sell.jpg",
-  plot = fund_sectors_buy,
-  width = 8, height = 6, units = "in", dpi = 600
-)
-
-ggsave(
-  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/fund_sectors_buy.jpg",
-  plot = fund_sectors_sell,
-  width = 8, height = 6, units = "in", dpi = 600
-)
-```
-
-```{r}
 # 1. Process Buyer Data (Positive only)
 buyer_long <- buyer_summary_table %>%
   select(end_date, ends_with("-positive")) %>% 
@@ -646,20 +629,6 @@ seller_re <- ggplot(seller_long, aes(x = end_date, y = sector_total, color = sec
 
 print(buyer_re)
 print(seller_re)
-```
-
-```{r}
-ggsave(
-  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/buyer_re.jpg",
-  plot = buyer_re,
-  width = 8, height = 6, units = "in", dpi = 600
-)
-
-ggsave(
-  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/seller_re.jpg",
-  plot = seller_re,
-  width = 8, height = 6, units = "in", dpi = 600
-)
 ```
 
 ```{r}
@@ -954,26 +923,6 @@ re_no_dominant_sector_buy <- plot_re_sector(model = dec24_buy,
                               order_list = fund_by_market_cap$series_id)
 ```
 
-```{r}
-ggsave(
-  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/buyer_slope.jpg",
-  plot = re_buy_slope$combined_plot,
-  width = 16, height = 8, units = "in", dpi = 600
-)
-
-ggsave(
-  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/buyer_intercept.jpg",
-  plot = re_buy_intercept$combined_plot,
-  width = 16, height = 8, units = "in", dpi = 600
-)
-
-ggsave(
-  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/buyer_no_dominant_sector.jpg",
-  plot = re_no_dominant_sector_buy$plot,
-  width = 16, height = 8, units = "in", dpi = 600
-)
-```
-
 Sensitivity Analysis - Buy Side
 
 ```{r}
@@ -1073,21 +1022,64 @@ re_no_dominant_sector_sell <- plot_re_sector(model = dec24_sell,
 ```
 
 ```{r}
-ggsave(
-  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/seller_slope.jpg",
-  plot = re_sell_slope$combined_plot,
-  width = 16, height = 8, units = "in", dpi = 600
-)
+dec_sell_data <- dec24_sell@frame
 
-ggsave(
-  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/seller_intercept.jpg",
-  plot = re_sell_intercept$combined_plot,
-  width = 16, height = 8, units = "in", dpi = 600
-)
+set.seed(42)
 
-ggsave(
-  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/seller_no_dominant_sector.jpg",
-  plot = re_no_dominant_sector_sell$plot,
-  width = 16, height = 8, units = "in", dpi = 600
-)
+dec_data_summary_sell <- dec_sell_data %>%
+  group_by(series_id) %>%
+  summarise(observations_per_fund = n())
+
+# 1. Assign folds randomly within each fund to ensure balanced group coverage
+dec_sell_data <- dec_sell_data %>%
+  group_by(series_id) %>%
+  mutate(fold = sample(rep(1:5, length.out = n()))) %>%
+  ungroup()
+
+cv_preds <- numeric(nrow(dec_sell_data))
+
+# 2. Run 5-fold CV
+for (k in 1:5) {
+  train <- filter(dec_sell_data, fold != k)
+  test  <- filter(dec_sell_data, fold == k)
+  
+  # Fit LMM on training set
+  fit_cv <- lmer(boxcox_delta ~ 1 + vol + (1 + vol | series_id) + (1 | isin), data = train)
+  
+  # Predict on test set using existing fund/asset random effects
+  # allow.new.levels = TRUE handles any unseen fund/asset combinations safely
+  cv_preds[dec_sell_data$fold == k] <- predict(fit_cv, newdata = test, allow.new.levels = TRUE)
+}
+
+# 3. Calculate Out-of-Sample Conditional R-squared
+ss_res <- sum((dec_sell_data$boxcox_delta - cv_preds)^2)
+ss_tot <- sum((dec_sell_data$boxcox_delta - mean(dec_sell_data$boxcox_delta))^2)
+r2_cond_cv_sell <- 1 - (ss_res / ss_tot)
+
+cat("LOO CV Conditional R-Squared::", r2_cond_cv_sell)
+```
+
+```{r}
+#filtering out holding delta outliers (>0.05 in raw delta)
+sell_filter.05 <- split$sellers %>%
+  filter(abs(normalized_holding_delta) <= .05)
+
+seller_dec.05_model <- lmer(boxcox_delta ~ 1 + vol + (1 + vol | series_id) + (1 | isin), 
+                            data = sell_filter.05)
+summary(seller_dec.05_model)
+r.squaredGLMM(seller_dec.05_model)
+```
+
+```{r}
+#filtering out funds that have less than 5 data points
+filter_funds <- dec_data_summary_sell %>%
+  filter(observations_per_fund > 5) %>%
+  select(c("series_id"))
+
+larger_funds_sell <- dec_sell_data %>% filter(series_id %in% filter_funds$series_id)
+
+dec_large_model_sell <- lmer(boxcox_delta ~ 1 + vol + (1 + vol | series_id) + (1 | isin), 
+                        data = larger_funds_sell)
+summary(dec_large_model_sell)
+r.squaredGLMM(dec_large_model_sell)
 ```
