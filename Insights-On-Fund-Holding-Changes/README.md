@@ -1,5 +1,8 @@
 ## Instructions
-This folder contains the necessary files to reproduce results for the paper "SEC Form N-PORT: Insights on Fund Holding Changes," accepted to ASMBI. To reproduce the results, download the RDS files and the Quarto file. You will need to modify the path names used and install all necessary packages before running the Quarto file. Additional data needed to run this script (cleaned_crsp_with_universe.RDS) can be found in the N-PORT-Data-Collection folder.
+This folder contains the necessary files to reproduce results for the paper "SEC Form N-PORT: Insights on Fund Holding Changes," accepted to ASMBI: 
+https://onlinelibrary.wiley.com/doi/10.1002/asmb.70130
+
+To reproduce the results, download the RDS files and the Quarto file. You will need to modify the path names used and install all necessary packages before running the Quarto file. Additional data needed to run this script (cleaned_crsp_with_universe.RDS) can be found in the N-PORT-Data-Collection folder.
 
 
 ## Abstract
