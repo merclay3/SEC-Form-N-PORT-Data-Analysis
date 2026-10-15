@@ -1,1 +1,6 @@
+## Instructions
+This folder contains the necessary files to reproduce results for the paper "SEC Form N-PORT: Fund Trading Dynamics and Asset Volatility". To reproduce the results, download the RDS files and the Quarto file. You will need to modify the path names used and install all necessary packages before running the Quarto file. Additional data needed to run this script includes cleaned_crsp_with_universe.RDS (found in the N-PORT-Data-Collection folder) and adj_balance_aggregate_deltas.RDS (found in Insights-On-Fund-Holding-Changes folder).
 
+
+## Abstract
+Assessing institutional investor response to asset volatility, this paper addresses common characteristics of funds that trade contrarian to market behavior. To identify these funds, we use Securities and Exchange Commission Form N-PORT data to assess how quarterly changes in fund holdings are affected by asset volatility, using a random-effects model. The results suggest that diversified portfolios tend to respond differently to asset volatility than funds that are concentrated in a particular sector. This work builds on previous Form N-PORT analysis research and continues to show the value of this regulatory filing for deep market insight.
