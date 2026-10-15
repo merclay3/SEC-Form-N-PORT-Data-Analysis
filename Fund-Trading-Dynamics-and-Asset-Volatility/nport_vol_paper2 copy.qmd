@@ -1,0 +1,1093 @@
+---
+title: "NPORT Volatility Paper Workflow"
+format: pdf
+editor: visual
+---
+
+```{r}
+#| output: false
+library(quantmod)
+library(dplyr)
+library(zoo)
+library(lubridate)
+library(tidyverse)
+library(lme4)
+library(ggplot2)
+library(MuMIn)
+library(stats)
+library(rlang)
+library(brms)
+library(lattice)
+library(RQuantLib)
+library(PerformanceAnalytics)
+library(xts)
+library(bizdays)
+library(stringr)
+library(tidyr)
+library(ggpubr)
+library(ggthemes)
+library(patchwork)
+```
+
+## Load Data From NPORT Paper 1
+
+```{r}
+fund_lvl <- readRDS("/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/fund_level_deltas_vol.RDS")
+
+crsp_data <- readRDS('/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/NPORT/cleaned_crsp_with_universe.RDS')
+
+pdata_isins <- as.vector(readRDS('/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/NPORT/isins.RDS'))
+```
+
+## Get Volatility and Deltas
+
+```{r}
+get_vol_df <- function(nport,crsp){
+  
+  nport <- bind_rows(nport)
+  
+  #create key to join on
+  
+  key_df <- nport %>%
+    distinct(adj_period_of_report) %>%
+    mutate(
+      quarter_indicator = case_when(
+        month(adj_period_of_report) %in% c(1, 4, 7, 10) ~ 1,
+        month(adj_period_of_report) %in% c(2, 5, 8, 11) ~ 2,
+        month(adj_period_of_report) %in% c(3, 6, 9, 12) ~ 3,
+        TRUE ~ NA_real_ # For any other cases
+        )) %>%
+    group_by(quarter_indicator) %>%
+    mutate(window_start = dplyr::lag(adj_period_of_report),
+           key = paste0(
+             month(window_start),
+             "to",
+             month(adj_period_of_report),
+             "_",
+             year(adj_period_of_report)
+             )) %>%
+    select(adj_period_of_report, window_start, quarter_indicator, key) %>%
+    ungroup() %>%
+    drop_na()
+  
+  crsp_key <- crsp %>% 
+    left_join(key_df, 
+              join_by(date > window_start,
+                      date <= adj_period_of_report))
+
+  nport_key <- nport %>% left_join(key_df, by = "adj_period_of_report")
+  
+  #calculate log returns from crsp
+  returns_df <- crsp_key %>%
+    group_by(ISIN, quarter_indicator) %>%
+    arrange(date) %>%
+    mutate(
+      log_ret = log(adj_prc) - log(dplyr::lag(adj_prc))
+    ) %>%
+    filter(!is.na(log_ret)) %>%
+    ungroup()
+  
+  quarterly_vol <- returns_df %>%
+    group_by(ISIN, key) %>%
+    summarise(
+     vol = sd(log_ret),
+      .groups = "drop"
+   )
+  
+  
+  nport_vol <- nport_key %>%
+  left_join(
+    quarterly_vol %>% select(ISIN, key, vol),
+    by = c("isin" = "ISIN", "key")
+  ) %>%
+  select(series_id, isin, adj_period_of_report, 
+         adj_balance, adj_prc, notional_prc, 
+         notional_prc_delta, bal_delta, key, vol)
+
+  ##### Modify this because we are not working with notional price since they cancel out
+  final_df <- nport_vol %>%
+    group_by(isin, adj_period_of_report) %>%
+    mutate(
+      quarter_fund_value = sum(notional_prc, na.rm = TRUE), #this remains the same so we have notional fund value
+      balance_sum = sum(adj_balance, na.rm = TRUE), #for an internal check
+      normalized_holdings = adj_balance/sum(adj_balance, na.rm = TRUE) #this was changed but not name - adjusted notional price does not actually exist
+      ) %>%
+    ungroup() %>%
+    arrange(isin, series_id, adj_period_of_report)
+    
+  final_df <- final_df %>%
+    arrange(isin, series_id, adj_period_of_report) %>%
+    group_by(series_id, isin) %>%
+    mutate(normalized_holding_delta = c(NA, diff(normalized_holdings))) %>%
+    ungroup() %>%
+    drop_na(normalized_holding_delta)
+  
+  return(list(quarterly_vol, nport_vol, final_df))
+}
+```
+
+```{r}
+full_nport_vol <- get_vol_df(fund_lvl, crsp_data)
+
+filtered_nport_vol <- full_nport_vol[[3]] %>%
+  filter(isin %in% pdata_isins)
+```
+
+## Log Transformation
+
+```{r}
+filtered_nport_vol_bc <- filtered_nport_vol %>%
+  mutate(abs_delta = abs(normalized_holding_delta) + 1e-6)
+
+filtered_nport_vol_bc <- filtered_nport_vol_bc %>%
+  mutate(boxcox_delta = log(abs_delta))
+```
+
+## Zero Removal
+
+```{r}
+#patch in sectors
+nport_with_sectors <- readRDS('/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/NPORT/adj_balance_aggregate_deltas.RDS')
+
+isin_sectors <- nport_with_sectors %>%
+  group_by(isin) %>%
+  filter(adj_period_of_report == min(adj_period_of_report)) %>%
+  distinct(isin, SECTORS, keep.all = FALSE) %>%
+  select(isin, SECTORS)
+
+delta_df <- filtered_nport_vol_bc %>% 
+  left_join(isin_sectors, by = "isin")
+```
+
+```{r}
+log_sign <- delta_df %>%
+  mutate(delta_sign = sign(normalized_holding_delta))
+
+## Model with signs and zeros removed
+no_zeros <- log_sign %>%
+  filter(delta_sign != 0 & adj_balance != 0)
+
+delta_df <- no_zeros %>% 
+  select(-c(bal_delta, normalized_holdings, abs_delta))
+```
+
+## Rolling Window Pipeline
+
+I have a new starting point here of loading in the data so I do not overload the storage
+
+```{r}
+#Step 1: Gets trading dates that we will loop over
+get_signal_months <- function(prepped_data, window_months = 24) {
+  
+  all_months    <- sort(unique(prepped_data$adj_period_of_report))
+  signal_months <- all_months[all_months >= min(all_months) + months(window_months)]
+  
+  cat(sprintf("Total months in data:  %d\n", length(all_months)))
+  cat(sprintf("Signal months:         %d\n", length(signal_months)))
+  cat(sprintf("First signal month:    %s\n", min(signal_months)))
+  cat(sprintf("Last signal month:     %s\n", max(signal_months)))
+  
+  signal_months
+}
+
+#Step 2: Split data using rolling window and
+slice_training_window <- function(prepped_data, window_end, window_months = 24) {
+  
+  # Ensure window_end is in Date format
+  window_end <- as.Date(window_end)
+  
+  # Extract unique report dates from data
+  all_months <- sort(unique(prepped_data$adj_period_of_report))
+  
+  # Find the position of the user's window_end
+  end_idx <- which(all_months == window_end)
+  
+  if (length(end_idx) == 0) {
+    stop(sprintf("The provided window_end (%s) was not found in adj_period_of_report.", window_end))
+  }
+  
+  # Calculate start index based on unique data periods (inclusive of end date)
+  start_idx    <- max(1, end_idx - window_months)
+  window_start <- all_months[start_idx]
+  
+  # Filter the data using the calculated start and end dates
+  result <- prepped_data %>%
+    filter(adj_period_of_report >= window_start,
+           adj_period_of_report <= window_end)
+  
+  return(result)
+}
+
+#Step 3: Set a min number of assets held by a split into buyer and seller dataframes
+split_buyers_sellers <- function(train_data, min_assets = 10) {
+  
+  total_assets <- train_data %>%
+    group_by(series_id) %>%
+    filter(adj_period_of_report == min(adj_period_of_report)) %>%
+    filter(n() >= min_assets)
+  
+  buyers <- train_data %>%
+    filter(delta_sign == 1) %>%
+    ungroup()
+  
+  sellers <- train_data %>%
+    filter(delta_sign == -1) %>%
+    ungroup()
+  
+  cat(sprintf("Buyers:  %d rows | %d funds (dropped %d funds below min_assets)\n",
+              nrow(buyers),
+              n_distinct(buyers$series_id),
+              n_distinct(train_data$series_id) - n_distinct(buyers$series_id)))
+  cat(sprintf("Sellers: %d rows | %d funds (dropped %d funds below min_assets)\n",
+              nrow(sellers),
+              n_distinct(sellers$series_id),
+              n_distinct(train_data$series_id) - n_distinct(sellers$series_id)))
+  
+  list(buyers = buyers, sellers = sellers)
+}
+
+#Step 4: Obtain the dominant sector of each fund for the training dataframe window
+get_dominant_sectors <- function(train_df, percent = 0.25) {
+  
+  # 1. Sort Sectors and calculate proportions based on the earliest report period
+  sector_sorting <- train_df %>%
+    group_by(series_id) %>%
+    filter(adj_period_of_report == min(adj_period_of_report, na.rm = TRUE)) %>%
+    group_by(series_id, adj_period_of_report, SECTORS) %>%
+    summarise(sector_total = sum(notional_prc, na.rm = TRUE), .groups = "drop_last") %>%
+    mutate(proportion = sector_total / sum(sector_total)) %>%
+    ungroup()
+
+  # 2. Isolate the row with the highest proportion for each fund
+  dominant_sector_df <- sector_sorting %>% 
+    group_by(series_id) %>%
+    slice_max(proportion, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(
+      dominant_sector = if_else(
+        proportion >= percent, 
+        as.character(SECTORS), 
+        "No Dominant Sector"
+      )
+    ) %>%
+    select(series_id, dominant_sector, max_proportion = proportion) %>%
+    group_by(dominant_sector) %>%
+    arrange(desc(max_proportion), .by_group = TRUE) %>%
+    ungroup() # Un-grouping at the end keeps the output dataframe clean
+    
+  return(dominant_sector_df)
+}
+```
+
+## LME Models
+
+```{r}
+fit_lme_models <- function(split_data) {
+  
+  fit_one <- function(df, label) {
+    tryCatch(
+      {
+        m <- lmer(boxcox_delta ~ 1 + vol + (1 + vol | series_id) + (1 | isin),
+                  data = df)
+        cat(sprintf("%s model: converged = %s | fixed vol = %.4f\n",
+                    label,
+                    !any(grepl("failed to converge", m@optinfo$conv$lme4$messages %||% "")),
+                    fixef(m)["vol"]))
+        m
+      },
+      error = function(e) {
+        cat(sprintf("%s model FAILED: %s\n", label, e$message))
+        NULL
+      }
+    )
+  }
+  
+  list(
+    buyer_model  = fit_one(split_data$buyers,  "Buyer"),
+    seller_model = fit_one(split_data$sellers, "Seller")
+  )
+}
+
+extract_random_effects <- function(model, grpvar_filter, term_filter, ci_level = 0.95, sector_df = NULL) {
+  
+  # 1. Calculate CI multiplier
+  z <- qnorm(1 - (1 - ci_level) / 2)
+  
+  # 2. Extract and filter random effects
+  re_df <- as.data.frame(lme4::ranef(model, condVar = TRUE)) %>%
+    filter(grpvar == grpvar_filter & term == term_filter)
+  
+  if (nrow(re_df) == 0) {
+    stop("No data found matching the provided grpvar_filter and term_filter.")
+  }
+  
+  # 3. Calculate CIs and build primary dataframe
+  result_df <- re_df %>%
+    mutate(
+      lower  = condval - z * condsd,
+      upper  = condval + z * condsd,
+      signal = ifelse(lower > 0, "Positive Signal",
+               ifelse(upper < 0, "Negative Signal", "No Signal"))
+    ) %>%
+    select(
+      group        = grp, 
+      term,
+      beta         = condval,
+      se           = condsd,
+      lower_ci     = lower,
+      upper_ci     = upper,
+      signal
+    ) %>%
+    mutate(group = as.character(group))
+  
+  # 4. Join sector data
+  if (!is.null(sector_df)) {
+    result_df <- result_df %>%
+      left_join(sector_df, by = c("group" = "series_id"))
+  } else {
+    result_df$dominant_sector <- "Unknown"
+  }
+  
+  # Add metadata attributes for the plotting functions to use in titles/subtitles
+  attr(result_df, "grpvar_filter") <- grpvar_filter
+  attr(result_df, "term_filter")   <- term_filter
+  attr(result_df, "ci_level")      <- ci_level
+  
+  return(result_df)
+}
+```
+
+```{r}
+generate_summary_row <- function(beta_df, current_date) {
+  
+  row_df <- beta_df %>%
+    # 1. Calculate total number of funds per sector
+    group_by(dominant_sector) %>%
+    mutate(sector_total = n()) %>%
+    ungroup() %>%
+    
+    # 2. Count occurrences of each signal per sector
+    count(dominant_sector, signal, sector_total) %>%
+    
+    # 3. Calculate the proportion
+    mutate(proportion = n / sector_total) %>%
+    
+    # 4. Clean strings for column names
+    mutate(
+      dominant_sector = tolower(str_replace_all(dominant_sector, " ", "_")),
+      signal = case_when(
+        signal == "Positive Signal" ~ "positive",
+        signal == "Negative Signal" ~ "negative",
+        TRUE ~ "no_signal"
+      )
+    ) %>%
+    
+    # =========================================================================
+    # THE FIX: Force both 'positive' and 'negative' rows to exist for every sector.
+    # If they are missing, fill their 'proportion' with 0.
+    # =========================================================================
+    complete(
+      dominant_sector, 
+      signal = c("positive", "negative"), 
+      fill = list(proportion = 0)
+    ) %>%
+    
+    # 5. Filter for significant signals (no_signal rows drop out here)
+    filter(signal %in% c("positive", "negative")) %>%
+    
+    # 6. Drop metadata columns to ensure a single-row pivot
+    select(dominant_sector, signal, proportion) %>% 
+    
+    # 7. Pivot to wide format
+    pivot_wider(
+      names_from = c(dominant_sector, signal),
+      names_sep = "-",
+      values_from = proportion
+    ) %>%
+    
+    # 8. Append the end_date to the front
+    mutate(end_date = current_date, .before = 1)
+  
+  return(row_df)
+}
+```
+
+```{r}
+# 1. Initialize storage lists for models and raw betas
+all_models          <- list()
+all_betas           <- list()
+
+# 2. Initialize storage lists for the summary rows
+buyer_summary_rows  <- list()
+seller_summary_rows <- list()
+
+signal_months <- get_signal_months(delta_df, window_months = 24)
+
+for (i in 1:length(signal_months)) {
+  window_max      <- signal_months[i] 
+  current_month   <- as.character(window_max) 
+  
+  # Data prep pipeline
+  train           <- slice_training_window(delta_df, window_max, window_months = 24)
+  dominant_sector <- get_dominant_sectors(train)
+  split           <- split_buyers_sellers(train, min_assets = 10)
+  
+  # Fit the models
+  models          <- fit_lme_models(split)
+  all_models[[current_month]] <- models
+  
+  # Extract random effects (checking for NULLs if a model failed)
+  buyer_beta  <- NULL
+  seller_beta <- NULL
+  
+  if (!is.null(models$buyer_model)) {
+    buyer_beta <- extract_random_effects(
+      model         = models$buyer_model, 
+      grpvar_filter = "series_id", 
+      term_filter   = "vol", 
+      sector_df     = dominant_sector
+    )
+    
+    # Generate and store the summary row for Buyers
+    buyer_summary_rows[[current_month]] <- generate_summary_row(buyer_beta, window_max)
+  }
+  
+  if (!is.null(models$seller_model)) {
+    seller_beta <- extract_random_effects(
+      model         = models$seller_model, 
+      grpvar_filter = "series_id", 
+      term_filter   = "vol", 
+      sector_df     = dominant_sector
+    )
+    
+    # Generate and store the summary row for Sellers
+    seller_summary_rows[[current_month]] <- generate_summary_row(seller_beta, window_max)
+  }
+  
+  # Store raw betas
+  all_betas[[current_month]] <- list(
+    buyer_beta  = buyer_beta,
+    seller_beta = seller_beta
+  )
+  print(paste("Done with iteration", i))
+}
+
+# =========================================================================
+# AFTER THE LOOP: Combine the individual rows into master dataframes
+# =========================================================================
+buyer_summary_table  <- bind_rows(buyer_summary_rows)
+seller_summary_table <- bind_rows(seller_summary_rows)
+```
+
+## Paper Figures/Analysis
+
+### Universal Figures
+
+```{r}
+#MAKE SURE YOU LOAD IN DELTA DF
+r2000 <- delta_df %>%
+  select(isin, SECTORS) %>%
+  distinct() %>%
+  ungroup()
+
+sector_counts <- as.data.frame(table(r2000$SECTORS))
+colnames(sector_counts) <- c("Sector", "Count")
+
+# 3. Calculate percentages for labeling (optional but recommended)
+sector_counts$Fraction <- sector_counts$Count / sum(sector_counts$Count)
+sector_counts$Percentage <- scales::percent(sector_counts$Fraction)
+
+sector_pie_chart <- ggpie(sector_counts, x = "Count", 
+      label = "Percentage",     # Or use your calculated percentages
+      fill = "Sector", 
+      palette = "Tableau 20",
+      lab.pos = "out",
+      legend = "right")  +      # Forces labels outside the slices automatically
+  scale_fill_tableau(palette = "Tableau 20") +
+  labs(title = "Percent Assets by Sector") +
+  theme(plot.title = element_text(size = 13.2, hjust = 0, face = "bold")) 
+
+
+print(sector_pie_chart)
+
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/sector_pie_chart.jpg",
+  plot = sector_pie_chart,
+  width = 8, height = 6, units = "in", dpi = 600
+)
+```
+
+```{r}
+buyer_sector_count  <- list()
+seller_sector_count <- list()
+
+for(i in 1:length(all_betas)){
+  buyer_beta <- all_betas[[i]]$buyer_beta
+  seller_beta <- all_betas[[i]]$seller_beta
+  
+  buyer_sector_count[[i]] <- buyer_beta %>%
+    group_by(dominant_sector) %>%
+    summarise(sector_total = n()) %>%
+    mutate(date = as.Date(names(all_betas)[i]) %m-% months(24))
+  
+  seller_sector_count[[i]] <- seller_beta %>%
+    group_by(dominant_sector) %>%
+    summarise(sector_total = n()) %>%
+    mutate(date = as.Date(names(all_betas)[i]) %m-% months(24))
+}
+
+# Combine the lists into two separate dataframes
+final_buyer_df  <- bind_rows(buyer_sector_count)
+final_seller_df <- bind_rows(seller_sector_count)
+
+############################################################
+
+fund_sectors_buy <- ggplot(final_buyer_df, aes(x = date, y = sector_total, color = dominant_sector, group = dominant_sector)) +
+  geom_line(linewidth = 1) +                  # Draws the lines
+  geom_point(size = 2) +                      # Adds points to the time markers
+  labs(title = "Fund Dominant Sector: Buy-Side",
+       x = "Period of Report Date",
+       y = "Number of Fund",
+       color = "Dominant Sector") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(size = 13.2, hjust = 0, face = "bold")) +
+  scale_color_tableau(palette = "Tableau 20")
+
+
+fund_sectors_sell <- ggplot(final_seller_df, aes(x = date, y = sector_total, color = dominant_sector, group = dominant_sector)) +
+  geom_line(linewidth = 1) +                  
+  geom_point(size = 2) +                      
+  labs(title = "Fund Dominant Sector: Sell-Side",
+       x = "Period of Report Date",
+       y = "Number of Funds",
+       color = "Dominant Sector") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(size = 13.2, hjust = 0, face = "bold")) +
+  scale_color_tableau(palette = "Tableau 20")
+
+print(fund_sectors_buy)
+print(fund_sectors_sell)
+```
+
+```{r}
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/fund_sectors_sell.jpg",
+  plot = fund_sectors_buy,
+  width = 8, height = 6, units = "in", dpi = 600
+)
+
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/fund_sectors_buy.jpg",
+  plot = fund_sectors_sell,
+  width = 8, height = 6, units = "in", dpi = 600
+)
+```
+
+```{r}
+# 1. Process Buyer Data (Positive only)
+buyer_long <- buyer_summary_table %>%
+  select(end_date, ends_with("-positive")) %>% 
+  pivot_longer(
+    cols = -end_date, 
+    names_to = "sector", 
+    values_to = "sector_total"
+  ) %>% 
+  # Clean up the names (e.g., change "technology-positive" to just "technology")
+  mutate(sector = str_remove(sector, "-positive"),
+         sector = str_replace_all(sector, "_", " "),
+         sector = str_to_title(sector)
+  )
+
+# 2. Process Seller Data (Negative only)
+seller_long <- seller_summary_table %>%
+  select(end_date, ends_with("-negative")) %>% 
+  pivot_longer(
+    cols = -end_date, 
+    names_to = "sector", 
+    values_to = "sector_total"
+  ) %>% 
+  # Clean up the names (e.g., change "technology-negative" to just "technology")
+  mutate(sector = str_remove(sector, "-negative"),
+         sector = str_replace_all(sector, "_", " "),
+         sector = str_to_title(sector)
+  )
+
+###################################################
+
+buyer_re <- ggplot(buyer_long, aes(x = end_date, y = sector_total, color = sector, group = sector)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  labs(
+    title = "Proportion of Positive Buyer Random Effects",
+    x = "Period of Report Date",
+    y = "Percent Significant",
+    color = "Sector"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(size = 13.2, hjust = 0, face = "bold")) + # Rotates date labels if they overlap
+  scale_color_tableau(palette = "Tableau 20")
+
+seller_re <- ggplot(seller_long, aes(x = end_date, y = sector_total, color = sector, group = sector)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  labs(
+    title = "Proportion of Negative Seller Random Effects",
+    x = "Period of Report Date",
+    y = "Percent Significant",
+    color = "Sector"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(size = 13.2, hjust = 0, face = "bold")) +
+  scale_color_tableau(palette = "Tableau 20")
+
+print(buyer_re)
+print(seller_re)
+```
+
+```{r}
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/buyer_re.jpg",
+  plot = buyer_re,
+  width = 8, height = 6, units = "in", dpi = 600
+)
+
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/seller_re.jpg",
+  plot = seller_re,
+  width = 8, height = 6, units = "in", dpi = 600
+)
+```
+
+```{r}
+betas_per_time <- c()
+for(i in 1:length(all_betas)){
+  betas_per_time[i] <- 
+    length(unique(c(all_betas[[i]]$buyer_beta$group, all_betas[[i]]$seller_beta$group)))
+}
+
+summary(betas_per_time)
+```
+
+### December 2024
+
+```{r}
+#obtain december 2024 data
+signal_months <- get_signal_months(delta_df, window_months = 24)
+dec2024 <- signal_months[length(signal_months)]
+  
+train           <- slice_training_window(delta_df, dec2024, window_months = 24)
+dominant_sector <- get_dominant_sectors(train)
+split           <- split_buyers_sellers(train, min_assets = 10)
+```
+
+```{r}
+plot_re_combined <- function(model,
+                             grpvar_filter,
+                             term_filter,
+                             ci_level = 0.95,
+                             sector_df = NULL,
+                             order_list = NULL, 
+                             title = "Random Effects & Signal Analysis", 
+                             subtitle = NULL,
+                             rel_widths = c(2, 1)) {
+  
+  # 1. Extract random effects data from the fitted lme4 model
+  beta_df <- extract_random_effects(
+    model         = model,
+    grpvar_filter = grpvar_filter,
+    term_filter   = term_filter,
+    ci_level      = ci_level,
+    sector_df     = sector_df
+  )
+  
+  # 2. Check Metadata & Warnings
+  if (all(beta_df$dominant_sector == "Unknown")) {
+    warning("sector_df was not provided during extraction; all sectors are labeled 'Unknown'.")
+  }
+  
+  # Standardize Signal factor levels and colors across both plots
+  signal_levels <- c("Positive Signal", "Negative Signal", "No Signal")
+  signal_colors <- c(
+    "Positive Signal" = "#4E79A7",
+    "Negative Signal" = "#F28E2B",
+    "No Signal"       = "#BAB0AC"
+  )
+  
+  beta_df <- beta_df %>%
+    mutate(signal = factor(signal, levels = signal_levels))
+  
+  # Apply Group Ordering (if specified)
+  if (!is.null(order_list)) {
+    beta_df <- beta_df %>%
+      mutate(group = factor(group, levels = order_list)) %>%
+      arrange(group)
+  }
+  
+  # ------------------------------------------------------------------
+  # Plot 1: Caterpillar Plot (Faceted Wide)
+  # ------------------------------------------------------------------
+  p1_data <- beta_df %>%
+    arrange(desc(signal == "No Signal"))
+  
+  p1 <- ggplot(p1_data, aes(x = group, y = beta, color = signal)) +
+    geom_point(size = 2.5) +
+    geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    scale_color_manual(values = signal_colors, drop = FALSE) +
+    facet_grid(
+      . ~ dominant_sector, 
+      scales = "free_x", 
+      switch = "x", 
+      labeller = label_wrap_gen(width = 12)
+    ) +
+    labs(
+      x = "Dominant Sector",
+      y = "Random Effect"
+    ) +
+    theme_bw() +
+    theme(
+      axis.text.x      = element_blank(),  
+      axis.ticks.x     = element_blank(),
+      strip.background = element_blank(),     
+      strip.text       = element_text(face = "bold", size = 7, angle = 45, hjust = 0.5, vjust = 0.5), 
+      panel.spacing    = unit(0.8, "lines")
+    ) +
+    guides(color = "none")  # Prevents duplicate/redundant legend
+  
+  # ------------------------------------------------------------------
+  # Plot 2: Normal Barplot (Signal Counts)
+  # ------------------------------------------------------------------
+  p2_data <- beta_df %>%
+    count(dominant_sector, signal, .drop = FALSE) %>%
+    mutate(signal = factor(signal, levels = c("No Signal", "Negative Signal", "Positive Signal")))
+  
+  p2 <- ggplot(p2_data, aes(x = dominant_sector, y = n, fill = signal)) +
+    geom_bar(stat = "identity", position = position_stack(reverse = TRUE), width = 0.7) +
+    scale_fill_manual(name = "Signal Type", values = signal_colors, drop = FALSE) +
+    scale_x_discrete(labels = scales::label_wrap(12)) + # Match 12-char label wrapping of p1
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) + # Flush baseline at y = 0
+    labs(
+      x = "Dominant Sector",
+      y = "Number of Funds"
+    ) +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(
+        face   = "bold",
+        size   = 7,       # Matches p1 font size
+        angle  = 45,
+        hjust  = 1,       # Anchors label text flush against ticks
+        vjust  = 1
+      )
+    )
+
+  # ------------------------------------------------------------------
+  # Combine Plots with Shared Title
+  # ------------------------------------------------------------------
+  combined_plot <- (p1 + wrap_elements(p2)) +
+    plot_layout(widths = rel_widths) +
+    plot_annotation(
+      title    = title,
+      subtitle = subtitle,
+      theme    = theme(
+        plot.title    = element_text(hjust = 0, face = "bold", size = 14),
+        plot.subtitle = element_text(hjust = 0, size = 11)
+      )
+    )
+
+  print(combined_plot)
+  
+  return(list(
+    data          = invisible(beta_df), 
+    bar_data      = invisible(p2_data), 
+    combined_plot = combined_plot
+  ))
+}
+```
+
+```{r}
+#pull a specific sector facet from Caterpillar Plot
+plot_re_sector <- function(model,
+                           grpvar_filter,
+                           term_filter,
+                           target_sector,
+                           ci_level = 0.95,
+                           sector_df = NULL,
+                           order_list = NULL, 
+                           title = NULL, 
+                           subtitle = NULL) {
+  
+  # 1. Extract random effects data from the fitted lme4 model
+  beta_df <- extract_random_effects(
+    model         = model,
+    grpvar_filter = grpvar_filter,
+    term_filter   = term_filter,
+    ci_level      = ci_level,
+    sector_df     = sector_df
+  )
+  
+  # 2. Check sector metadata & filter for the target sector
+  if (all(beta_df$dominant_sector == "Unknown")) {
+    warning("sector_df was not provided during extraction; all sectors are labeled 'Unknown'.")
+  }
+  
+  beta_df_filtered <- beta_df %>%
+    filter(dominant_sector == target_sector)
+  
+  if (nrow(beta_df_filtered) == 0) {
+    stop(sprintf("Target sector '%s' was not found in the dataset.", target_sector))
+  }
+  
+  # Set default dynamic title if none is provided
+  if (is.null(title)) {
+    title <- paste("Random Effects Analysis:", target_sector)
+  }
+  
+  # Standardize Signal factor levels and colors
+  signal_levels <- c("Positive Signal", "Negative Signal", "No Signal")
+  signal_colors <- c(
+    "Positive Signal" = "#4E79A7",
+    "Negative Signal" = "#F28E2B",
+    "No Signal"       = "#BAB0AC"
+  )
+  
+  beta_df_filtered <- beta_df_filtered %>%
+    mutate(signal = factor(signal, levels = signal_levels))
+  
+  # Apply Group Ordering (if specified)
+  if (!is.null(order_list)) {
+    beta_df_filtered <- beta_df_filtered %>%
+      mutate(group = factor(group, levels = order_list)) %>%
+      arrange(group)
+  }
+  
+  # ------------------------------------------------------------------
+  # Faceted Caterpillar Plot (Single Sector)
+  # ------------------------------------------------------------------
+  p_data <- beta_df_filtered %>%
+    arrange(desc(signal == "No Signal"))
+  
+  p <- ggplot(p_data, aes(x = group, y = beta, color = signal)) +
+    geom_point(size = 2.5) +
+    geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    scale_color_manual(name = "Signal Type", values = signal_colors, drop = FALSE) +
+    facet_grid(
+      . ~ dominant_sector, 
+      scales = "free_x", 
+      switch = "x", 
+      labeller = label_wrap_gen(width = 20)
+    ) +
+    labs(
+      title    = title,
+      subtitle = subtitle,
+      x        = "Dominant Sector",
+      y        = "Random Effect"
+    ) +
+    theme_bw() +
+    theme(
+      plot.title       = element_text(hjust = 0, face = "bold", size = 14),
+      plot.subtitle    = element_text(hjust = 0, size = 11),
+      axis.text.x      = element_blank(),  
+      axis.ticks.x     = element_blank(),
+      strip.background = element_blank(),     
+      strip.text       = element_text(face = "bold", size = 9, angle = 0, hjust = 0.5, vjust = 0.5), 
+      panel.spacing    = unit(0.8, "lines")
+    )
+
+  print(p)
+  
+  return(list(
+    data = invisible(beta_df_filtered), 
+    plot = p
+  ))
+}
+```
+
+Ordering by Market Cap
+
+```{r}
+fund_by_market_cap <- delta_df %>% 
+  group_by(series_id) %>%
+  filter(adj_period_of_report >= as.Date("2022-12-30")) %>%
+  filter(adj_period_of_report == min(adj_period_of_report)) %>%
+  summarise(fund_value = sum(notional_prc)) %>%
+  arrange(fund_value) %>%
+  ungroup()
+```
+
+#### Buyer Model
+
+```{r}
+dec24_buy <- all_models$`2024-12-31`$buyer_model
+summary(dec24_buy)
+r.squaredGLMM(dec24_buy)
+```
+
+```{r}
+re_buy_slope <- plot_re_combined(model = dec24_buy, 
+                              grpvar_filter = "series_id",
+                              term_filter = "vol",
+                              ci_level = 0.95,
+                              sector_df = dominant_sector,
+                              title = "Buyer Random Slopes",
+                              order_list = fund_by_market_cap$series_id) 
+
+re_buy_intercept <- plot_re_combined(model = dec24_buy, 
+                              grpvar_filter = "series_id",
+                              term_filter = "(Intercept)",
+                              ci_level = 0.95,
+                              sector_df = dominant_sector,
+                              title = "Buyer Random Intercepts",
+                              order_list = fund_by_market_cap$series_id)
+
+re_no_dominant_sector_buy <- plot_re_sector(model = dec24_buy,
+                              grpvar_filter = "series_id",
+                              term_filter   = "vol",
+                              target_sector = "No Dominant Sector",
+                              sector_df     = dominant_sector,
+                              title = "Buyer Random Slopes: No Dominant Sector",
+                              order_list = fund_by_market_cap$series_id)
+```
+
+```{r}
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/buyer_slope.jpg",
+  plot = re_buy_slope$combined_plot,
+  width = 16, height = 8, units = "in", dpi = 600
+)
+
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/buyer_intercept.jpg",
+  plot = re_buy_intercept$combined_plot,
+  width = 16, height = 8, units = "in", dpi = 600
+)
+
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/buyer_no_dominant_sector.jpg",
+  plot = re_no_dominant_sector_buy$plot,
+  width = 16, height = 8, units = "in", dpi = 600
+)
+```
+
+Sensitivity Analysis - Buy Side
+
+```{r}
+dec_buy_data <- dec24_buy@frame
+
+set.seed(42)
+
+# 1. Assign folds randomly within each fund to ensure balanced group coverage
+dec_buy_data <- dec_buy_data %>%
+  group_by(series_id) %>%
+  mutate(fold = sample(rep(1:5, length.out = n()))) %>%
+  ungroup()
+
+cv_preds_buy <- numeric(nrow(dec_buy_data))
+
+# 2. Run 5-fold CV
+for (k in 1:5) {
+  train <- filter(dec_buy_data, fold != k)
+  test  <- filter(dec_buy_data, fold == k)
+  
+  # Fit LMM on training set
+  fit_cv <- lmer(boxcox_delta ~ 1 + vol + (1 + vol | series_id) + (1 | isin), data = train)
+  
+  # Predict on test set using existing fund/asset random effects
+  # allow.new.levels = TRUE handles any unseen fund/asset combinations safely
+  cv_preds_buy[dec_buy_data$fold == k] <- predict(fit_cv, newdata = test, allow.new.levels = TRUE)
+}
+
+# 3. Calculate Out-of-Sample Conditional R-squared
+ss_res <- sum((dec_buy_data$boxcox_delta - cv_preds_buy)^2)
+ss_tot <- sum((dec_buy_data$boxcox_delta - mean(dec_buy_data$boxcox_delta))^2)
+r2_cond_cv_buy <- 1 - (ss_res / ss_tot)
+
+cat("LOO CV Conditional R-Squared:", r2_cond_cv_buy)
+```
+
+```{r}
+#filtering out holding delta outliers (>0.05 in raw delta)
+filter.05 <- split$buyers %>%
+  filter(abs(normalized_holding_delta) <= .05)
+
+dec.05_model <- lmer(boxcox_delta ~ 1 + vol + (1 + vol | series_id) + (1 | isin), data = filter.05)
+summary(dec.05_model)
+r.squaredGLMM(dec.05_model)
+```
+
+```{r}
+#filtering out funds that have less than 5 data points
+dec_data_summary_buy <- dec_buy_data %>%
+  group_by(series_id) %>%
+  summarise(observations_per_fund = n())
+
+filter_funds <- dec_data_summary_buy %>%
+  filter(observations_per_fund > 5) %>%
+  select(c("series_id"))
+
+larger_funds <- dec_buy_data %>% filter(series_id %in% filter_funds$series_id)
+
+dec_large_model <- lmer(boxcox_delta ~ 1 + vol + (1 + vol | series_id) + (1 | isin), 
+                        data = larger_funds)
+summary(dec_large_model)
+r.squaredGLMM(dec_large_model)
+```
+
+#### Seller Model
+
+```{r}
+dec24_sell <- all_models$`2024-12-31`$seller_model
+summary(dec24_sell)
+r.squaredGLMM(dec24_sell)
+```
+
+```{r}
+re_sell_slope <- plot_re_combined(model = dec24_sell, 
+                              grpvar_filter = "series_id",
+                              term_filter = "vol",
+                              ci_level = 0.95,
+                              sector_df = dominant_sector,
+                              title = "Seller Random Slopes",
+                              order_list = fund_by_market_cap$series_id) 
+
+re_sell_intercept <- plot_re_combined(model = dec24_sell, 
+                              grpvar_filter = "series_id",
+                              term_filter = "(Intercept)",
+                              ci_level = 0.95,
+                              sector_df = dominant_sector,
+                              title = "Seller Random Intercepts",
+                              order_list = fund_by_market_cap$series_id)
+
+re_no_dominant_sector_sell <- plot_re_sector(model = dec24_sell,
+                              grpvar_filter = "series_id",
+                              term_filter   = "vol",
+                              target_sector = "No Dominant Sector",
+                              sector_df     = dominant_sector,
+                              title = "Seller Random Slopes: No Dominant Sector",
+                              order_list = fund_by_market_cap$series_id)
+```
+
+```{r}
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/seller_slope.jpg",
+  plot = re_sell_slope$combined_plot,
+  width = 16, height = 8, units = "in", dpi = 600
+)
+
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/seller_intercept.jpg",
+  plot = re_sell_intercept$combined_plot,
+  width = 16, height = 8, units = "in", dpi = 600
+)
+
+ggsave(
+  "/Users/mlc10/Library/CloudStorage/OneDrive-RiceUniversity/13F Project/Project 3/paper_figures/seller_no_dominant_sector.jpg",
+  plot = re_no_dominant_sector_sell$plot,
+  width = 16, height = 8, units = "in", dpi = 600
+)
+```
